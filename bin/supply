@@ -13,4 +13,16 @@ output_dir=$(mktemp -d -t supplyXXX)
 echo "-----> Running go build supply"
 GOROOT=$GoInstallDir/go GOPATH=$BUILDPACK_DIR $GoInstallDir/go/bin/go build -o $output_dir/supply nodejs/supply/cli
 
+# Add ffmpeg binary and libraries to path
+echo "-----> Installing ffmpeg"
+
+BP_DIR=$(cd $(dirname $0); cd ..; pwd)
+
+mkdir -p "$BUILD_DIR/vendor/"
+tar xzf $BP_DIR/vendor/ffmpeg.tar.gz -C $BUILD_DIR/vendor/
+
+mkdir -p "$BUILD_DIR/.profile.d"
+echo "export PATH=\"\$HOME/vendor/ffmpeg:\$PATH\";" >> "$BUILD_DIR/.profile.d/ffmpeg.sh"
+echo "export LD_LIBRARY_PATH=\"\$HOME/vendor/ffmpeg/lib/\";" >> "$BUILD_DIR/.profile.d/ffmpeg.sh"
+
 $output_dir/supply "$BUILD_DIR" "$CACHE_DIR" "$DEPS_DIR" "$DEPS_IDX"
