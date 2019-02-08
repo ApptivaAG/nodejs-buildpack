@@ -15,16 +15,17 @@ pushd $BUILDPACK_DIR
 GOROOT=$GoInstallDir/go $GoInstallDir/go/bin/go build -mod=vendor -o $output_dir/supply ./src/nodejs/supply/cli
 popd
 
-# Add ffmpeg binary and libraries to path
-echo "-----> Installing ffmpeg"
+# Add ffmpeg / pdftocairo binaries and libraries to path
+echo "-----> Installing ffmpeg and pdftocairo"
 
 BP_DIR=$(cd $(dirname $0); cd ..; pwd)
 
 mkdir -p "$BUILD_DIR/vendor/"
 tar xzf $BP_DIR/vendor/ffmpeg.tar.gz -C $BUILD_DIR/vendor/
+tar xzf $BP_DIR/vendor/pdftocairo.tar.gz -C $BUILD_DIR/vendor/
 
 mkdir -p "$BUILD_DIR/.profile.d"
-echo "export PATH=\"\$HOME/vendor/ffmpeg:\$PATH\";" >> "$BUILD_DIR/.profile.d/ffmpeg.sh"
-echo "export LD_LIBRARY_PATH=\"\$HOME/vendor/ffmpeg/lib/\";" >> "$BUILD_DIR/.profile.d/ffmpeg.sh"
+echo "export PATH=\"\$HOME/vendor/ffmpeg/bin:\$PATH\";" >> "$BUILD_DIR/.profile.d/ffmpeg.sh"
+echo "export PATH=\"\$HOME/vendor/pdftocairo/bin:\$PATH\";" >> "$BUILD_DIR/.profile.d/pdftocairo.sh"
 
 $output_dir/supply "$BUILD_DIR" "$CACHE_DIR" "$DEPS_DIR" "$DEPS_IDX"
