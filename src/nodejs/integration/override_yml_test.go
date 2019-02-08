@@ -29,16 +29,16 @@ var _ = Describe("override yml", func() {
 		}
 
 		buildpackName = "override_yml_" + cutlass.RandStringRunes(5)
-		Expect(cutlass.CreateOrUpdateBuildpack(buildpackName, filepath.Join(bpDir, "fixtures", "overrideyml_bp"))).To(Succeed())
+		Expect(cutlass.CreateOrUpdateBuildpack(buildpackName, filepath.Join(bpDir, "fixtures", "overrideyml_bp"), "")).To(Succeed())
 
 		app = cutlass.New(filepath.Join(bpDir, "fixtures", "simple_app"))
 		app.Buildpacks = []string{buildpackName + "_buildpack", "nodejs_buildpack"}
 	})
 
 	It("Forces node from override buildpack", func() {
-		Expect(app.Push()).ToNot(Succeed())
+		Expect(app.V3Push()).ToNot(Succeed())
+		Eventually(func() error { return app.ConfirmBuildpack(buildpackVersion) }, "30s").Should(Succeed())
 		Eventually(app.Stdout.String).Should(ContainSubstring("-----> OverrideYML Buildpack"))
-		Eventually(func() error { return app.ConfirmBuildpack(buildpackVersion) }).Should(Succeed())
 
 		Eventually(app.Stdout.String).Should(ContainSubstring("-----> Installing node"))
 		Eventually(app.Stdout.String).Should(MatchRegexp("Copy .*/node.tgz"))

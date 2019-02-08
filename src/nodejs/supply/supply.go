@@ -3,13 +3,17 @@ package supply
 import (
 	"bufio"
 	"bytes"
-	"errors"
 	"fmt"
+	"github.com/Masterminds/semver"
 	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
+
+	"github.com/cloudfoundry/nodejs-buildpack/src/nodejs/package_json"
 
 	"github.com/cloudfoundry/libbuildpack"
 	"github.com/cloudfoundry/libbuildpack/checksum"
@@ -22,6 +26,9 @@ type Command interface {
 type Manifest interface {
 	AllDependencyVersions(string) []string
 	DefaultVersion(string) (libbuildpack.Dependency, error)
+}
+
+type Installer interface {
 	InstallDependency(libbuildpack.Dependency, string) error
 	InstallOnlyVersion(string, string) error
 }
@@ -32,7 +39,7 @@ type NPM interface {
 }
 
 type Yarn interface {
-	Build(string, string, string) error
+	Build(string, string) error
 }
 
 type Stager interface {
@@ -47,44 +54,55 @@ type Stager interface {
 }
 
 type Supplier struct {
-	Stager             Stager
-	Manifest           Manifest
-	Log                *libbuildpack.Logger
-	Logfile            *os.File
-	Command            Command
-	NodeVersion        string
-	YarnVersion        string
-	NPMVersion         string
-	PreBuild           string
-	StartScript        string
-	HasDevDependencies bool
-	PostBuild          string
-	UseYarn            bool
-	NPMRebuild         bool
-	Yarn               Yarn
-	NPM                NPM
+	Stager                 Stager
+	Manifest               Manifest
+	Installer              Installer
+	Log                    *libbuildpack.Logger
+	Logfile                *os.File
+	Command                Command
+	NodeVersion            string
+	PackageJSONNodeVersion string
+	NvmrcNodeVersion       string
+	YarnVersion            string
+	NPMVersion             string
+	PreBuild               string
+	StartScript            string
+	HasDevDependencies     bool
+	PostBuild              string
+	UseYarn                bool
+	UsesYarnWorkspaces     bool
+	IsVendored             bool
+	Yarn                   Yarn
+	NPM                    NPM
 }
 
-type packageJSON struct {
-	Engines engines `json:"engines"`
-}
-
-type engines struct {
-	Node string `json:"node"`
-	Yarn string `json:"yarn"`
-	NPM  string `json:"npm"`
-	Iojs string `json:"iojs"`
+var LTS = map[string]int{
+	"argon":   4,
+	"boron":   6,
+	"carbon":  8,
+	"dubnium": 10,
 }
 
 func Run(s *Supplier) error {
 	return checksum.Do(s.Stager.BuildDir(), s.Log.Debug, func() error {
 		s.Log.BeginStep("Installing binaries")
+
 		if err := s.LoadPackageJSON(); err != nil {
 			s.Log.Error("Unable to load package.json: %s", err.Error())
 			return err
 		}
 
+		if err := s.LoadNvmrc(); err != nil {
+			s.Log.Error("Unable to load .nvmrc: %s", err.Error())
+			return err
+		}
+
 		s.WarnNodeEngine()
+
+		if err := s.ChooseNodeVersion(); err != nil {
+			s.Log.Error("Unable to install node: %s", err.Error())
+			return err
+		}
 
 		if err := s.InstallNode("/tmp/node"); err != nil {
 			s.Log.Error("Unable to install node: %s", err.Error())
@@ -121,6 +139,11 @@ func Run(s *Supplier) error {
 			return err
 		}
 
+		if err := s.NoPackageLockTip(); err != nil {
+			s.Log.Error(err.Error())
+			return err
+		}
+
 		s.ListNodeConfig(os.Environ())
 
 		if err := s.OverrideCacheFromApp(); err != nil {
@@ -139,6 +162,13 @@ func Run(s *Supplier) error {
 			return err
 		}
 
+		if !s.UseYarn || !s.UsesYarnWorkspaces {
+			if err := s.MoveDependencyArtifacts(); err != nil {
+				s.Log.Error("Unable to move dependencies: %s", err.Error())
+				return err
+			}
+		}
+
 		s.ListDependencies()
 
 		if err := s.Logfile.Sync(); err != nil {
@@ -153,8 +183,6 @@ func Run(s *Supplier) error {
 
 		return nil
 	})
-	// dirChecksum.After()
-
 }
 
 func (s *Supplier) WarnUnmetDependencies() error {
@@ -229,31 +257,17 @@ func (s *Supplier) BuildDependencies() error {
 		return err
 	}
 
-	pkgDir := filepath.Join(s.Stager.DepDir(), "packages")
-	nodePath := filepath.Join(pkgDir, "node_modules")
-	if err := copyAll(s.Stager.BuildDir(), pkgDir, []string{"package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", ".npmrc", ".yarnrc", "node_modules"}); err != nil {
-		return err
-	}
-
-	if err := s.Stager.WriteEnvFile("NODE_PATH", nodePath); err != nil {
-		return err
-	}
-
-	if err := os.Setenv("NODE_PATH", nodePath); err != nil {
-		return err
-	}
-
 	if s.UseYarn {
-		if err := s.Yarn.Build(s.Stager.BuildDir(), pkgDir, s.Stager.CacheDir()); err != nil {
+		if err := s.Yarn.Build(s.Stager.BuildDir(), s.Stager.CacheDir()); err != nil {
 			return err
 		}
-	} else if s.NPMRebuild {
+	} else if s.IsVendored {
 		s.Log.Info("Prebuild detected (node_modules already exists)")
-		if err := s.NPM.Rebuild(pkgDir); err != nil {
+		if err := s.NPM.Rebuild(s.Stager.BuildDir()); err != nil {
 			return err
 		}
 	} else {
-		if err := s.NPM.Build(pkgDir, s.Stager.CacheDir()); err != nil {
+		if err := s.NPM.Build(s.Stager.BuildDir(), s.Stager.CacheDir()); err != nil {
 			return err
 		}
 	}
@@ -265,6 +279,34 @@ func (s *Supplier) BuildDependencies() error {
 	return nil
 }
 
+func (s *Supplier) MoveDependencyArtifacts() error {
+	if s.IsVendored {
+		return nil
+	}
+
+	appNodeModules := filepath.Join(s.Stager.BuildDir(), "node_modules")
+
+	_, err := os.Stat(appNodeModules)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	nodePath := filepath.Join(s.Stager.DepDir(), "node_modules")
+
+	if err := os.Rename(appNodeModules, nodePath); err != nil {
+		return err
+	}
+
+	if err := s.Stager.WriteEnvFile("NODE_PATH", nodePath); err != nil {
+		return err
+	}
+
+	return os.Setenv("NODE_PATH", nodePath)
+}
+
 func (s *Supplier) ReadPackageJSON() error {
 	var err error
 	var p struct {
@@ -274,13 +316,14 @@ func (s *Supplier) ReadPackageJSON() error {
 			StartScript string `json:"start"`
 		} `json:"scripts"`
 		DevDependencies map[string]string `json:"devDependencies"`
+		Workspaces      []string          `json:"workspaces"`
 	}
 
 	if s.UseYarn, err = libbuildpack.FileExists(filepath.Join(s.Stager.BuildDir(), "yarn.lock")); err != nil {
 		return err
 	}
 
-	if s.NPMRebuild, err = libbuildpack.FileExists(filepath.Join(s.Stager.BuildDir(), "node_modules")); err != nil {
+	if s.IsVendored, err = libbuildpack.FileExists(filepath.Join(s.Stager.BuildDir(), "node_modules")); err != nil {
 		return err
 	}
 
@@ -293,11 +336,36 @@ func (s *Supplier) ReadPackageJSON() error {
 		}
 	}
 
+	s.UsesYarnWorkspaces = (len(p.Workspaces) > 0)
 	s.HasDevDependencies = (len(p.DevDependencies) > 0)
 	s.PreBuild = p.Scripts.PreBuild
 	s.PostBuild = p.Scripts.PostBuild
 	s.StartScript = p.Scripts.StartScript
 
+	return nil
+}
+
+func (s *Supplier) NoPackageLockTip() error {
+	var lockFiles []string
+	if s.UseYarn {
+		lockFiles = append(lockFiles, "yarn.lock")
+	} else {
+		lockFiles = append(lockFiles, "package-lock.json", "npm-shrinkwrap.json")
+	}
+
+	for _, lockFile := range lockFiles {
+		if lockFileExists, err := libbuildpack.FileExists(filepath.Join(s.Stager.BuildDir(), lockFile)); err != nil {
+			return err
+		} else if lockFileExists {
+			return nil
+		}
+
+		if s.IsVendored {
+			s.Log.Protip("Warning: package-lock.json not found. The buildpack may reach out to the internet to download module updates, even if they are vendored.", "https://docs.cloudfoundry.org/buildpacks/node/index.html#offline_environments")
+		}
+
+		return nil
+	}
 	return nil
 }
 
@@ -411,32 +479,97 @@ func fileHasString(file string, patterns ...string) (bool, error) {
 }
 
 func (s *Supplier) LoadPackageJSON() error {
-	var p packageJSON
-
-	err := libbuildpack.NewJSON().Load(filepath.Join(s.Stager.BuildDir(), "package.json"), &p)
-	if err != nil && !os.IsNotExist(err) {
+	p, err := package_json.LoadPackageJSON(filepath.Join(s.Stager.BuildDir(), "package.json"), s.Log)
+	if err != nil {
 		return err
 	}
 
-	if p.Engines.Iojs != "" {
-		return errors.New("io.js not supported by this buildpack")
-	}
-
-	if p.Engines.Node != "" {
-		s.Log.Info("engines.node (package.json): %s", p.Engines.Node)
-	} else {
-		s.Log.Info("engines.node (package.json): unspecified")
-	}
-
-	if p.Engines.NPM != "" {
-		s.Log.Info("engines.npm (package.json): %s", p.Engines.NPM)
-	} else {
-		s.Log.Info("engines.npm (package.json): unspecified (use default)")
-	}
-
-	s.NodeVersion = p.Engines.Node
+	s.PackageJSONNodeVersion = p.Engines.Node
 	s.NPMVersion = p.Engines.NPM
 	s.YarnVersion = p.Engines.Yarn
+
+	return nil
+}
+
+func formatNvmrcContent(version string) string {
+	if version == "node" {
+		return "*"
+	} else if strings.HasPrefix(version, "lts") {
+		ltsName := strings.Split(version, "/")[1]
+		if ltsName == "*" {
+			maxVersion := 0
+			for _, versionValue := range LTS {
+				if maxVersion < versionValue {
+					maxVersion = versionValue
+				}
+			}
+			return strconv.Itoa(maxVersion) + ".*.*"
+		} else {
+			versionNumber := LTS[ltsName]
+			return strconv.Itoa(versionNumber) + ".*.*"
+		}
+	} else {
+		matcher := regexp.MustCompile(semver.SemVerRegex)
+
+		groups := matcher.FindStringSubmatch(version)
+		for index := 0; index < len(groups); index++ {
+			if groups[index] == "" {
+				groups = append(groups[:index], groups[index+1:]...)
+				index--
+			}
+		}
+
+		return version + strings.Repeat(".*", 4-len(groups))
+	}
+}
+
+func (s *Supplier) LoadNvmrc() error {
+	if nvmrcExists, err := libbuildpack.FileExists(filepath.Join(s.Stager.BuildDir(), ".nvmrc")); err != nil {
+		return err
+	} else if !nvmrcExists {
+		return nil
+	}
+
+	nvmrcContents, err := ioutil.ReadFile(filepath.Join(s.Stager.BuildDir(), ".nvmrc"))
+	if err != nil {
+		return err
+	}
+
+	nvmrcVersion, err := validateNvmrc(string(nvmrcContents))
+	if err != nil {
+		return err
+	}
+
+	s.NvmrcNodeVersion = formatNvmrcContent(nvmrcVersion)
+
+	return nil
+}
+
+func (s *Supplier) ChooseNodeVersion() error {
+	var (
+		selectedVersion string
+		err             error
+	)
+
+	versions := s.Manifest.AllDependencyVersions("node")
+
+	if s.PackageJSONNodeVersion != "" {
+		if selectedVersion, err = libbuildpack.FindMatchingVersion(s.PackageJSONNodeVersion, versions); err != nil {
+			return err
+		}
+	} else if s.NvmrcNodeVersion != "" {
+		if selectedVersion, err = libbuildpack.FindMatchingVersion(s.NvmrcNodeVersion, versions); err != nil {
+			return err
+		}
+	} else {
+		if dep, err := s.Manifest.DefaultVersion("node"); err != nil {
+			return err
+		} else {
+			selectedVersion = dep.Version
+		}
+	}
+
+	s.NodeVersion = selectedVersion
 
 	return nil
 }
@@ -444,16 +577,29 @@ func (s *Supplier) LoadPackageJSON() error {
 func (s *Supplier) WarnNodeEngine() {
 	docsLink := "http://docs.cloudfoundry.org/buildpacks/node/node-tips.html"
 
-	if s.NodeVersion == "" {
-		s.Log.Warning("Node version not specified in package.json. See: %s", docsLink)
+	if s.NvmrcNodeVersion != "" && s.PackageJSONNodeVersion == "" {
+		s.Log.Warning("Using the node version specified in your .nvmrc See: %s", docsLink)
 	}
-	if s.NodeVersion == "*" {
+	if s.PackageJSONNodeVersion != "" && s.NvmrcNodeVersion != "" {
+		s.Log.Warning("Node version in .nvmrc ignored in favor of 'engines' field in package.json")
+	}
+	if s.PackageJSONNodeVersion == "" && s.NvmrcNodeVersion == "" {
+		s.Log.Warning("Node version not specified in package.json or .nvmrc. See: %s", docsLink)
+	}
+	if s.PackageJSONNodeVersion == "*" {
 		s.Log.Warning("Dangerous semver range (*) in engines.node. See: %s", docsLink)
 	}
-	if strings.HasPrefix(s.NodeVersion, ">") {
+	if s.NvmrcNodeVersion == "node" {
+		s.Log.Warning(".nvmrc specified latest node version, this will be selected from versions available in manifest.yml")
+	}
+
+	if strings.HasPrefix(s.NvmrcNodeVersion, "lts") {
+		s.Log.Warning(".nvmrc specified an lts version, this will be selected from versions available in manifest.yml")
+	}
+
+	if strings.HasPrefix(s.PackageJSONNodeVersion, ">") {
 		s.Log.Warning("Dangerous semver range (>) in engines.node. See: %s", docsLink)
 	}
-	return
 }
 
 func (s *Supplier) InstallNode(tempDir string) error {
@@ -461,24 +607,10 @@ func (s *Supplier) InstallNode(tempDir string) error {
 
 	nodeInstallDir := filepath.Join(s.Stager.DepDir(), "node")
 
-	if s.NodeVersion != "" {
-		versions := s.Manifest.AllDependencyVersions("node")
-		ver, err := libbuildpack.FindMatchingVersion(s.NodeVersion, versions)
-		if err != nil {
-			return err
-		}
-		dep.Name = "node"
-		dep.Version = ver
-	} else {
-		var err error
+	dep.Name = "node"
+	dep.Version = s.NodeVersion
 
-		dep, err = s.Manifest.DefaultVersion("node")
-		if err != nil {
-			return err
-		}
-	}
-
-	if err := s.Manifest.InstallDependency(dep, tempDir); err != nil {
+	if err := s.Installer.InstallDependency(dep, tempDir); err != nil {
 		return err
 	}
 
@@ -532,7 +664,7 @@ func (s *Supplier) InstallYarn() error {
 
 	yarnInstallDir := filepath.Join(s.Stager.DepDir(), "yarn")
 
-	if err := s.Manifest.InstallOnlyVersion("yarn", yarnInstallDir); err != nil {
+	if err := s.Installer.InstallOnlyVersion("yarn", yarnInstallDir); err != nil {
 		return err
 	}
 
@@ -584,14 +716,23 @@ func (s *Supplier) CreateDefaultEnv() error {
 		return err
 	}
 
-	scriptContents := `export NODE_HOME=%s
+	scriptContents := `export NODE_HOME=%[1]s
 export NODE_ENV=${NODE_ENV:-production}
 export MEMORY_AVAILABLE=$(echo $VCAP_APPLICATION | jq '.limits.mem')
 export WEB_MEMORY=${WEB_MEMORY:-512}
 export WEB_CONCURRENCY=${WEB_CONCURRENCY:-1}
+if [ ! -d "$HOME/node_modules" ]; then
+	export NODE_PATH=${NODE_PATH:-"%[2]s"}
+	ln -s "%[2]s" "$HOME/node_modules"
+else
+	export NODE_PATH=${NODE_PATH:-"$HOME/node_modules"}
+fi
+export PATH=$PATH:"$HOME/bin":$NODE_PATH/.bin
 `
-
-	return s.Stager.WriteProfileD("node.sh", fmt.Sprintf(scriptContents, filepath.Join("$DEPS_DIR", s.Stager.DepsIdx(), "node")))
+	return s.Stager.WriteProfileD("node.sh",
+		fmt.Sprintf(scriptContents,
+			filepath.Join("$DEPS_DIR", s.Stager.DepsIdx(), "node"),
+			filepath.Join("$DEPS_DIR", s.Stager.DepsIdx(), "node_modules")))
 }
 
 func copyAll(srcDir, destDir string, files []string) error {
@@ -634,4 +775,28 @@ func (s *Supplier) OverrideCacheFromApp() error {
 	}
 
 	return nil
+}
+
+func validateNvmrc(content string) (string, error) {
+	content = strings.TrimSpace(strings.ToLower(content))
+
+	if content == "lts/*" || content == "node" {
+		return content, nil
+	}
+
+	for key, _ := range LTS {
+		if content == strings.ToLower("lts/"+key) {
+			return content, nil
+		}
+	}
+
+	if len(content) > 0 && content[0] == 'v' {
+		content = content[1:]
+	}
+
+	if _, err := semver.NewVersion(content); err != nil {
+		return "", fmt.Errorf("invalid version %s specified in .nvmrc", err)
+	}
+
+	return content, nil
 }

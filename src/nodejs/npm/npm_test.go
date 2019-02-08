@@ -3,7 +3,7 @@ package npm_test
 import (
 	"bytes"
 	"io/ioutil"
-	n "nodejs/npm"
+	n "github.com/cloudfoundry/nodejs-buildpack/src/nodejs/npm"
 	"os"
 	"path/filepath"
 
@@ -16,7 +16,7 @@ import (
 
 //go:generate mockgen -source=npm.go --destination=mocks_test.go --package=npm_test
 
-var _ = Describe("Yarn", func() {
+var _ = Describe("NPM", func() {
 	var (
 		err         error
 		buildDir    string
